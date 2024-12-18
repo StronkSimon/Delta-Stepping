@@ -41,6 +41,7 @@ import qualified Data.Vector.Mutable                                as V
 import qualified Data.Vector.Storable                               as M ( unsafeFreeze )
 import qualified Data.Vector.Storable.Mutable                       as M
 
+-- Data types
 
 type Graph    = Gr String Distance  -- Graphs have nodes labelled with Strings and edges labelled with their distance
 type Node     = Int                 -- Nodes (vertices) in the graph are integers in the range [0..]
@@ -66,120 +67,174 @@ deltaStepping
     -> Node                             -- index of the starting node
     -> IO (Vector Distance)
 deltaStepping verbose graph delta source = do
-  threadCount <- getNumCapabilities             -- the number of (kernel) threads to use: the 'x' in '+RTS -Nx'
-
-  -- Initialise the algorithm
-  (buckets, distances)  <- initialise graph delta source
-  printVerbose verbose "initialse" graph delta buckets distances
-
-  let
-    -- The algorithm loops while there are still non-empty buckets
-    loop = do
-      done <- allBucketsEmpty buckets
-      if done
-      then return ()
-      else do
-        printVerbose verbose "result" graph delta buckets distances
-        step verbose threadCount graph delta buckets distances
-        loop
-  loop
-
-  printVerbose verbose "result" graph delta buckets distances
-  -- Once the tentative distances are finalised, convert into an immutable array
-  -- to prevent further updates. It is safe to use this "unsafe" function here
-  -- because the mutable vector will not be used any more, so referential
-  -- transparency is preserved for the frozen immutable vector.
-  --
-  -- NOTE: The function 'Data.Vector.convert' can be used to translate between
-  -- different (compatible) vector types (e.g. boxed to storable)
-  --
-  M.unsafeFreeze distances
-
+  -- Get the number of threads available for parallel execution
+  num_threads <- getNumCapabilities
+  -- Initialise the state: buckets and tentative distances
+  (buck, tent) <- initialise graph delta source
+  -- Relax the source node to initialize the algorithm
+  relax buck tent delta (source, 0)
+  -- Perform delta-stepping until all buckets are empty
+  deltaStep buck tent num_threads
+  -- Convert mutable distances to an immutable vector for return
+  M.unsafeFreeze tent
+  where
+    -- Recursively perform steps of the delta-stepping algorithm
+    deltaStep :: Buckets -> TentativeDistances -> Int -> IO ()
+    deltaStep buck tent threads = do
+      weGood <- allBucketsEmpty buck
+      unless weGood $ do
+        step verbose graph delta buck tent threads
+        deltaStep buck tent threads
 -- Initialise algorithm state
 --
 initialise
-    :: Graph
+    :: Gr String Distance
     -> Distance
     -> Node
     -> IO (Buckets, TentativeDistances)
 initialise graph delta source = do
-  undefined
+  -- Determine maximum edge weight to calculate bucket count
+  let maxWeight = maximum [d | (_, _, d) <- G.labEdges graph]
+  let noOfBuckets = ceiling (maxWeight / delta)  -- Dynamically determine bucket count
+
+  -- Create a reference for the index of the first bucket
+  firstBucketIndex <- newIORef 0
+  -- Initialize buckets as an array of empty sets
+  bucketArray <- V.replicate noOfBuckets Set.empty
+
+  let buckets = Buckets firstBucketIndex bucketArray
+
+  -- Initialize tentative distances to infinity
+  tentDistances <- M.replicate (G.noNodes graph) infinity
+  -- Set the source node's tentative distance to 0
+  M.write tentDistances source 0
+
+  return (buckets, tentDistances)
 
 
 -- Take a single step of the algorithm.
 -- That is, one iteration of the outer while loop.
 --
-step
-    :: Bool
-    -> Int
-    -> Graph
-    -> Distance
-    -> Buckets
-    -> TentativeDistances
-    -> IO ()
-step verbose threadCount graph delta buckets distances = do
-  -- In this function, you need to implement the body of the outer while loop,
-  -- which contains another while loop.
-  -- See function 'deltaStepping' for inspiration on implementing a while loop
-  -- in a functional language.
-  -- For debugging purposes, you may want to place:
-  --   printVerbose verbose "inner step" graph delta buckets distances
-  -- in the inner loop.
-  undefined
+step :: Bool -> Graph -> Distance -> Buckets -> TentativeDistances -> Int -> IO ()
+step verbose graph delta buck@(Buckets i arr) tent threads = do
+  -- Find the smallest non-empty bucket and update the first bucket reference
+  smallestBuckIndex <- findNextBucket buck
+  writeIORef i smallestBuckIndex
 
+  -- Perform the inner while loop and collect requests for relaxation
+  r <- innerWhile graph delta buck tent Set.empty threads
 
--- Once all buckets are empty, the tentative distances are finalised and the
+  -- Process long-range requests for edges exceeding delta threshold
+  req <- findRequests (>= delta) graph r tent
+  relaxRequests buck tent delta req threads
+
+-- Perform the inner while loop of the delta-stepping algorithm
+-- Moves through the current bucket and processes nodes with edges < delta
+innerWhile :: Graph -> Distance -> Buckets -> TentativeDistances -> IntSet -> Int -> IO (IntSet)
+innerWhile graph delta buck@(Buckets i arr) tent toDelete threads = do
+  bucketIndex <- readIORef i
+  currentIntSet <- V.read arr bucketIndex
+
+  if not (Set.null currentIntSet)
+    then do
+      -- Find requests for edges with weights < delta
+      req <- findRequests (< delta) graph currentIntSet tent
+      let onion = Set.union toDelete currentIntSet
+
+      -- Clear the current bucket
+      V.write arr bucketIndex Set.empty
+
+      -- Relax the requests and recurse
+      relaxRequests buck tent delta req threads
+      innerWhile graph delta buck tent onion threads
+    else return toDelete
+    
+-- Adjust the firstBucket index to point to the next non-empty bucket
+adjustFirstBucket :: Buckets -> IO ()
+adjustFirstBucket Buckets{..} = do
+  let bucketCount = V.length bucketArray
+  newFirst <- foldM
+    (\currentMin i -> do
+      bucket <- V.read bucketArray i
+      if Set.null bucket then return currentMin else return (min currentMin i))
+    bucketCount
+    [0 .. bucketCount - 1]
+  writeIORef firstBucket newFirst
+
+-- Once all buckets are empty, the tentative distances are finalised, and the
 -- algorithm terminates.
 --
 allBucketsEmpty :: Buckets -> IO Bool
-allBucketsEmpty buckets = do
-  undefined
+allBucketsEmpty (Buckets i arr) = readIORef i >>= \x -> go (V.drop x arr)
+  where
+    go :: V.IOVector IntSet -> IO Bool
+    go v | V.null v  = return True
+         | otherwise = do
+             h <- V.read v 0
+             if Set.null h
+               then go (V.drop 1 v)
+               else return False
 
-
--- Return the index of the smallest on-empty bucket. Assumes that there is at
+-- Return the index of the smallest non-empty bucket. Assumes that there is at
 -- least one non-empty bucket remaining.
 --
 findNextBucket :: Buckets -> IO Int
-findNextBucket buckets = do
-  undefined
-
+findNextBucket Buckets{..} = do
+  bucketIndex <- readIORef firstBucket
+  let findNonEmpty idx = do
+        bucket <- V.read bucketArray idx
+        if Set.null bucket then findNonEmpty ((idx + 1) `mod` V.length bucketArray) else return idx
+  findNonEmpty bucketIndex
 
 -- Create requests of (node, distance) pairs that fulfil the given predicate
 --
 findRequests
-    :: Int
-    -> (Distance -> Bool)
-    -> Graph
+    :: (Distance -> Bool)
+    -> Gr String Distance
     -> IntSet
     -> TentativeDistances
     -> IO (IntMap Distance)
-findRequests threadCount p graph v' distances = do
-  undefined
-
+findRequests p graph v' tent = do
+  let bucketContents = Set.elems v'
+  let filteredEdges = filter
+        (\(from, _, d) -> p d && from `elem` bucketContents)
+        (G.labEdges graph)
+  requests <- mapM createRequest filteredEdges
+  return (Map.unionsWith min requests)
+  where
+    createRequest :: G.LEdge Float -> IO (IntMap Distance)
+    createRequest (v, w, c) = do
+      tentativeDistanceV <- M.read tent v
+      return (Map.singleton w (tentativeDistanceV + c))
 
 -- Execute requests for each of the given (node, distance) pairs
 --
 relaxRequests
-    :: Int
-    -> Buckets
+    :: Buckets
     -> TentativeDistances
     -> Distance
     -> IntMap Distance
+    -> Int
     -> IO ()
-relaxRequests threadCount buckets distances delta req = do
-  undefined
-
+relaxRequests buckets tent delta req threads = do
+  let requests = Map.toAscList req
+      requestChunks = chunks (length requests `div` threads + 1) requests
+  forkThreads (length requestChunks) (\i -> mapM_ (relax buckets tent delta) (requestChunks !! i))
+  where
+    chunks n xs = takeWhile (not . null) (map (take n) (iterate (drop n) xs))
 
 -- Execute a single relaxation, moving the given node to the appropriate bucket
 -- as necessary
 --
-relax :: Buckets
-      -> TentativeDistances
-      -> Distance
-      -> (Node, Distance) -- (w, x) in the paper
-      -> IO ()
-relax buckets distances delta (node, newDistance) = do
-  undefined
+relax :: Buckets -> TentativeDistances -> Distance -> (Node, Distance) -> IO ()
+relax Buckets{..} tent delta (w, x) = do
+  let bs = bucketArray
+  tentW <- M.read tent w
+  when (x < tentW) $ do
+    unless (isInfinite tentW) $
+      V.modify bs (Set.delete w) (round $ tentW / delta)
+    V.modify bs (Set.insert w) (round $ x / delta)
+    M.write tent w x
 
 
 -- -----------------------------------------------------------------------------
@@ -304,4 +359,3 @@ printBucket graph bucket distances = do
       Just l  -> printf "  %4d  |  %5v  |  %f\n" v l x
   --
   printf "\n"
-
